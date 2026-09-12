@@ -762,25 +762,3 @@ if __name__ == "__main__":
 
         sys.exit(1)
 
-Install and run
-
-pip install instaloader
-
-Then:
-
-python instagram_analyzer.py
-
-For example:
-
-INSTAGRAM PUBLIC PROFILE ANALYZER
-
-Target Instagram username: example_user
-Maximum posts to collect (default 20): 10
-Maximum comments per post (default 50): 20
-
-The program creates:
-
-instagram_results/
-├── example_user.json
-├── example_user_posts.csv
-└── example_user_comments.csv
