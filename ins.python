@@ -1,0 +1,427 @@
+"""
+Instagram Public Profile Analyzer (Enhanced with Rate-Limit Handling & Backoff)
+-----------------------------------------------------------------------------
+
+Collects publicly accessible profile/post information using Instaloader.
+Includes built-in exponential backoff, request jitter, and session support
+to mitigate HTTP 429 (Too Many Requests) errors.
+
+Features:
+- Search a target username with automatic retry on rate limits
+- Display public profile information
+- Collect public posts/reels with randomized delays
+- Collect publicly accessible comments when available
+- Export results to JSON and CSV
+- Optional session cookie loading for authenticated scraping
+
+Install:
+    pip install instaloader
+
+Run:
+    python instagram_analyzer.py
+"""
+
+import csv
+import json
+import random
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+import instaloader
+from instaloader.exceptions import ConnectionException, ProfileNotExistsException
+
+
+# ---------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------
+
+OUTPUT_DIR = Path("instagram_results")
+
+# Maximum number of posts to process.
+DEFAULT_MAX_POSTS = 20
+
+# Maximum comments to collect per post.
+DEFAULT_MAX_COMMENTS = 50
+
+# Base delay between requests (seconds).
+REQUEST_DELAY = 3
+
+# Maximum retries for rate-limited requests
+MAX_RETRIES = 3
+
+
+# ---------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------
+
+def clean_text(value):
+    """Make text safe for CSV/JSON output."""
+    if value is None:
+        return ""
+    return str(value).replace("\x00", "").strip()
+
+
+def safe_filename(username):
+    """Create a safe filename."""
+    allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+    result = "".join(char if char in allowed else "_" for char in username)
+    return result or "instagram_user"
+
+
+def make_loader():
+    """Create an Instaloader instance with custom headers and configurations."""
+    loader = instaloader.Instaloader(
+        download_pictures=False,
+        download_videos=False,
+        download_video_thumbnails=False,
+        download_geotags=False,
+        save_metadata=False,
+        compress_json=False,
+    )
+    
+    # Optional: Load session if session file exists in current directory 
+    # to avoid aggressive unauthenticated rate limits.
+    # Format: session-<username> generated via loader.save_session_to_file()
+    session_files = list(Path(".").glob("session-*"))
+    if session_files:
+        session_file = session_files[0]
+        account_name = session_file.name.replace("session-", "")
+        try:
+            loader.load_session_from_file(account_name)
+            print(f"[*] Loaded existing session for: @{account_name}")
+        except Exception as exc:
+            print(f"[!] Could not load session file: {exc}")
+
+    return loader
+
+
+def smart_sleep():
+    """Sleep for a randomized duration to mimic human behavior and avoid bans."""
+    sleep_time = REQUEST_DELAY + random.uniform(1.0, 3.0)
+    time.sleep(sleep_time)
+
+
+# ---------------------------------------------------------
+# Profile
+# ---------------------------------------------------------
+
+def get_profile(loader, username):
+    """Find a public Instagram profile with retry logic for rate limits."""
+    username = username.strip().lstrip("@")
+    if not username:
+        raise ValueError("Username cannot be empty.")
+
+    retries = 0
+    while retries <= MAX_RETRIES:
+        try:
+            profile = instaloader.Profile.from_username(loader.context, username)
+            return profile
+        except ConnectionException as exc:
+            if "429" in str(exc) or "Too Many Requests" in str(exc):
+                retries += 1
+                backoff = (2 ** retries) * 30  # Exponential backoff: 60s, 120s, 240s...
+                print(f"\n[!] Rate-limited (429) while fetching profile. Backing off for {backoff} seconds (Attempt {retries}/{MAX_RETRIES})...")
+                time.sleep(backoff)
+            else:
+                raise RuntimeError(f"Connection error accessing @{username}: {exc}")
+        except Exception as exc:
+            raise RuntimeError(f"Could not access @{username}: {exc}")
+            
+    raise RuntimeError(f"Max retries reached. IP address is heavily rate-limited by Instagram.")
+
+
+def profile_to_dict(profile):
+    """Convert profile information to a dictionary."""
+    return {
+        "username": clean_text(profile.username),
+        "full_name": clean_text(profile.full_name),
+        "biography": clean_text(profile.biography),
+        "followers": profile.followers,
+        "following": profile.followees,
+        "posts": profile.mediacount,
+        "is_private": profile.is_private,
+        "is_verified": profile.is_verified,
+        "external_url": clean_text(profile.external_url),
+        "profile_url": f"https://www.instagram.com/{profile.username}/",
+    }
+
+
+# ---------------------------------------------------------
+# Comments
+# ---------------------------------------------------------
+
+def collect_comments(post, max_comments):
+    """Collect comments that are publicly accessible with exception handling."""
+    comments = []
+    if max_comments <= 0:
+        return comments
+
+    try:
+        for index, comment in enumerate(post.get_comments()):
+            if index >= max_comments:
+                break
+
+            comments.append({
+                "username": clean_text(comment.owner.username),
+                "text": clean_text(comment.text),
+                "date": comment.created_at_utc.isoformat() if comment.created_at_utc else "",
+            })
+            
+            # Tiny internal pause to prevent comment fetching blocks
+            time.sleep(0.5)
+
+    except Exception as exc:
+        print(f"    [!] Comments unavailable or rate-limited: {exc}")
+
+    return comments
+
+
+# ---------------------------------------------------------
+# Posts
+# ---------------------------------------------------------
+
+def collect_posts(profile, max_posts, max_comments):
+    """Collect publicly accessible posts/reels with built-in rate-limit handling."""
+    posts = []
+
+    if profile.is_private:
+        print("\n[!] This profile is private. Only exposed public info can be collected.")
+        return posts
+
+    print("\nCollecting posts...\n")
+
+    try:
+        post_iterator = profile.get_posts()
+        index = 0
+
+        while index < max_posts:
+            try:
+                # Safely fetch the next post from the generator with retry wrapper
+                post = next(post_iterator, None)
+                if not post:
+                    break
+                
+                print(f"[{index + 1}/{max_posts}] {post.shortcode}")
+
+                if post.is_video:
+                    media_type = "video"
+                elif post.typename == "GraphSidecar":
+                    media_type = "carousel"
+                else:
+                    media_type = "photo"
+
+                comments = collect_comments(post, max_comments)
+
+                post_data = {
+                    "shortcode": clean_text(post.shortcode),
+                    "url": f"https://www.instagram.com/p/{post.shortcode}/",
+                    "media_type": media_type,
+                    "date": post.date_utc.isoformat() if post.date_utc else "",
+                    "caption": clean_text(post.caption),
+                    "likes": post.likes,
+                    "comments_count": post.comments,
+                    "is_video": post.is_video,
+                    "video_view_count": post.video_view_count if post.is_video else None,
+                    "owner": clean_text(post.owner_username),
+                    "comments": comments,
+                }
+
+                posts.append(post_data)
+                index += 1
+                smart_sleep()
+
+            except ConnectionException as exc:
+                if "429" in str(exc) or "Too Many Requests" in str(exc):
+                    print(f"\n[!] Hit HTTP 429 rate limit mid-collection. Pausing for 90 seconds to cool down...")
+                    time.sleep(90)
+                    continue
+                else:
+                    print(f"\n[!] Connection exception encountered: {exc}")
+                    break
+
+    except KeyboardInterrupt:
+        print("\n[!] Stopped by user.")
+    except Exception as exc:
+        print(f"\n[!] Error while collecting posts: {exc}")
+
+    return posts
+
+
+# ---------------------------------------------------------
+# Export JSON & CSV
+# ---------------------------------------------------------
+
+def save_json(username, profile_data, posts):
+    """Save complete data to JSON."""
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    filename = OUTPUT_DIR / f"{safe_filename(username)}.json"
+
+    result = {
+        "scraped_at": datetime.utcnow().isoformat(),
+        "profile": profile_data,
+        "posts": posts,
+    }
+
+    with filename.open("w", encoding="utf-8") as file:
+        json.dump(result, file, indent=4, ensure_ascii=False)
+
+    return filename
+
+
+def save_posts_csv(username, posts):
+    """Save post information to CSV."""
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    filename = OUTPUT_DIR / f"{safe_filename(username)}_posts.csv"
+
+    fields = [
+        "shortcode", "url", "media_type", "date", "caption",
+        "likes", "comments_count", "is_video", "video_view_count", "owner",
+    ]
+
+    with filename.open("w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=fields)
+        writer.writeheader()
+        for post in posts:
+            row = {field: post.get(field, "") for field in fields}
+            writer.writerow(row)
+
+    return filename
+
+
+def save_comments_csv(username, posts):
+    """Save publicly accessible comments to CSV."""
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    filename = OUTPUT_DIR / f"{safe_filename(username)}_comments.csv"
+
+    fields = [
+        "post_shortcode", "post_url", "comment_username",
+        "comment_date", "comment_text",
+    ]
+
+    with filename.open("w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=fields)
+        writer.writeheader()
+        for post in posts:
+            for comment in post.get("comments", []):
+                writer.writerow({
+                    "post_shortcode": post["shortcode"],
+                    "post_url": post["url"],
+                    "comment_username": comment["username"],
+                    "comment_date": comment["date"],
+                    "comment_text": comment["text"],
+                })
+
+    return filename
+
+
+# ---------------------------------------------------------
+# Display
+# ---------------------------------------------------------
+
+def display_profile(profile_data):
+    """Display profile information."""
+    print("\n" + "=" * 60)
+    print("PROFILE")
+    print("=" * 60)
+    print(f"Username     : @{profile_data['username']}")
+    print(f"Name         : {profile_data['full_name']}")
+    print(f"Followers    : {profile_data['followers']:,}")
+    print(f"Following    : {profile_data['following']:,}")
+    print(f"Posts        : {profile_data['posts']:,}")
+    print(f"Private      : {profile_data['is_private']}")
+    print(f"Verified     : {profile_data['is_verified']}")
+    print(f"Website      : {profile_data['external_url']}")
+    print(f"Profile URL  : {profile_data['profile_url']}")
+    print(f"\nBio:\n{profile_data['biography']}")
+    print("=" * 60)
+
+
+def display_posts(posts):
+    """Display collected posts."""
+    print("\n" + "=" * 60)
+    print("POSTS")
+    print("=" * 60)
+
+    for index, post in enumerate(posts, 1):
+        print(f"\n--- Post {index} ---")
+        print(f"Type       : {post['media_type']}")
+        print(f"Date       : {post['date']}")
+        print(f"Likes      : {post['likes']}")
+        print(f"Comments   : {post['comments_count']}")
+        if post["is_video"]:
+            print(f"Video views: {post['video_view_count']}")
+        print(f"URL        : {post['url']}")
+        
+        caption = post["caption"]
+        if caption:
+            print(f"Caption    : {caption[:300]}")
+
+        comments = post.get("comments", [])
+        if comments:
+            print(f"Public comments collected: {len(comments)}")
+            for comment in comments[:5]:
+                print(f"  @{comment['username']}: {comment['text'][:100]}")
+
+
+# ---------------------------------------------------------
+# Main
+# ---------------------------------------------------------
+
+def main():
+    print("=" * 60)
+    print(" INSTAGRAM PUBLIC PROFILE ANALYZER (ENHANCED)")
+    print("=" * 60)
+
+    username = input("\nTarget Instagram username: ").strip()
+    if not username:
+        print("Username required.")
+        return
+
+    max_posts_input = input(f"Maximum posts to collect (default {DEFAULT_MAX_POSTS}): ").strip()
+    max_posts = int(max_posts_input) if max_posts_input.isdigit() else DEFAULT_MAX_POSTS
+
+    comments_input = input(f"Maximum comments per post (default {DEFAULT_MAX_COMMENTS}): ").strip()
+    max_comments = int(comments_input) if comments_input.isdigit() else DEFAULT_MAX_COMMENTS
+
+    loader = make_loader()
+
+    print(f"\nSearching for @{username.lstrip('@')}...")
+    try:
+        profile = get_profile(loader, username)
+    except Exception as exc:
+        print(f"\n[ERROR] {exc}")
+        return
+
+    profile_data = profile_to_dict(profile)
+    display_profile(profile_data)
+
+    posts = collect_posts(profile, max_posts, max_comments)
+    if posts:
+        display_posts(posts)
+
+    print("\nSaving results...")
+    json_file = save_json(profile.username, profile_data, posts)
+    posts_csv = save_posts_csv(profile.username, posts)
+    comments_csv = save_comments_csv(profile.username, posts)
+
+    print("\n" + "=" * 60)
+    print("DONE")
+    print("=" * 60)
+    print(f"\nProfile: @{profile.username}")
+    print(f"Posts collected: {len(posts)}")
+    print(f"\nJSON file:\n  {json_file}")
+    print(f"\nPosts CSV:\n  {posts_csv}")
+    print(f"\nComments CSV:\n  {comments_csv}")
+    print("\nThe files are saved in the 'instagram_results' folder.")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\nStopped.")
+    except Exception as exc:
+        print(f"\nUnexpected error: {exc}")
+        sys.exit(1)
